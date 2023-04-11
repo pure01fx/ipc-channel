@@ -8,7 +8,7 @@
 // except according to those terms.
 
 use crate::platform::{self, OsIpcChannel, OsIpcReceiver, OsIpcReceiverSet, OsIpcSender};
-use crate::platform::{OsIpcOneShotServer, OsIpcSelectionResult, OsIpcSharedMemory, OsOpaqueIpcChannel};
+use crate::platform::{OsIpcOneShotServer, OsIpcOneShotServerConnectionStatus, OsIpcSelectionResult, OsIpcSharedMemory, OsOpaqueIpcChannel};
 
 use bincode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -768,6 +768,11 @@ pub struct IpcOneShotServer<T> {
     phantom: PhantomData<T>,
 }
 
+pub enum IpcOneShotServerConnectionStatus<T> {
+    Connected((IpcReceiver<T>,T)),
+    NotConnected(IpcOneShotServer<T>)
+}
+
 impl<T> IpcOneShotServer<T> where T: for<'de> Deserialize<'de> + Serialize {
     pub fn new() -> Result<(IpcOneShotServer<T>, String), io::Error> {
         let (os_server, name) = OsIpcOneShotServer::new()?;
@@ -792,6 +797,27 @@ impl<T> IpcOneShotServer<T> where T: for<'de> Deserialize<'de> + Serialize {
             os_receiver: os_receiver,
             phantom: PhantomData,
         }, value))
+    }
+
+    pub fn try_accept(self) -> Result<IpcOneShotServerConnectionStatus<T>, bincode::Error> {
+        match self.os_server.try_accept() {
+            Ok(OsIpcOneShotServerConnectionStatus::Connected((os_receiver, data, os_channels, os_shared_memory_regions))) => {
+                let value = OpaqueIpcMessage {
+                    data: data,
+                    os_ipc_channels: os_channels,
+                    os_ipc_shared_memory_regions: os_shared_memory_regions.into_iter()
+                                                                        .map(|os_shared_memory_region| {
+                        Some(os_shared_memory_region)
+                    }).collect(),
+                }.to()?;
+                Ok(IpcOneShotServerConnectionStatus::Connected((IpcReceiver {
+                    os_receiver: os_receiver,
+                    phantom: PhantomData,
+                }, value)))
+            },
+            Ok(OsIpcOneShotServerConnectionStatus::NotConnected(e)) => Ok(IpcOneShotServerConnectionStatus::NotConnected(IpcOneShotServer { os_server: e, phantom: self.phantom })),
+            Err(e) => Err(e.into())
+        }
     }
 }
 

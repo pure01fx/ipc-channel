@@ -1157,6 +1157,55 @@ impl OsIpcReceiver {
         }
     }
 
+    /// Do a pipe connect.
+    ///
+    /// Only used for one-shot servers.
+    fn try_accept(&self) -> Result<(),WinError> {
+        unsafe {
+            let reader_borrow = self.reader.borrow();
+            let handle = &reader_borrow.handle;
+            // Boxing this to get a stable address is not strictly necesssary here,
+            // since we are not moving the local variable around -- but better safe than sorry...
+            let mut ov = AliasedCell::new(Box::new(mem::zeroed::<winapi::um::minwinbase::OVERLAPPED>()));
+            let ok = winapi::um::namedpipeapi::ConnectNamedPipe(handle.as_raw(), ov.alias_mut().deref_mut());
+
+            // we should always get FALSE with async IO
+            assert_eq!(ok, FALSE);
+            let result = match GetLastError() {
+                // did we successfully connect? (it's reported as an error [ok==false])
+                winapi::shared::winerror::ERROR_PIPE_CONNECTED => {
+                    win32_trace!("[$ {:?}] accept (PIPE_CONNECTED)", handle.as_raw());
+                    Ok(())
+                },
+
+                // This is a weird one -- if we create a named pipe (like we do
+                // in new() ), the client connects, sends data, then drops its handle,
+                // a Connect here will get ERROR_NO_DATA -- but there may be data in
+                // the pipe that we'll be able to read.  So we need to go do some reads
+                // like normal and wait until ReadFile gives us ERROR_NO_DATA.
+                winapi::shared::winerror::ERROR_NO_DATA => {
+                    win32_trace!("[$ {:?}] accept (ERROR_NO_DATA)", handle.as_raw());
+                    Ok(())
+                },
+
+                // the connect is pending; wait for it to complete
+                winapi::shared::winerror::ERROR_IO_PENDING => {
+                    win32_trace!("[$ {:?}] accept (ERROR_IO_PENDING)", handle.as_raw());
+                    Err(WinError::NoConnection)
+                },
+
+                // Anything else signifies some actual I/O error.
+                _err => {
+                    win32_trace!("[$ {:?}] accept error -> {}", handle.as_raw(), _err);
+                    Err(WinError::last("ConnectNamedPipe"))
+                },
+            };
+
+            ov.into_inner();
+            result
+        }
+    }
+
     /// Does a single explicitly-sized recv from the handle,
     /// consuming the receiver in the process.
     ///
@@ -1725,6 +1774,11 @@ pub struct OsIpcOneShotServer {
     receiver: OsIpcReceiver,
 }
 
+pub enum OsIpcOneShotServerConnectionStatus {
+    Connected((OsIpcReceiver, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)),
+    NotConnected(OsIpcOneShotServer)
+}
+
 impl OsIpcOneShotServer {
     pub fn new() -> Result<(OsIpcOneShotServer, String),WinError> {
         let pipe_id = make_pipe_id();
@@ -1746,6 +1800,17 @@ impl OsIpcOneShotServer {
         receiver.accept()?;
         let (data, channels, shmems) = receiver.recv()?;
         Ok((receiver, data, channels, shmems))
+    }
+
+    pub fn try_accept(self) -> Result<OsIpcOneShotServerConnectionStatus,WinError> {
+        match self.receiver.try_accept() {
+            Ok(()) => {
+                let (data, channels, shmems) = self.receiver.recv()?;
+                Ok(OsIpcOneShotServerConnectionStatus::Connected((self.receiver, data, channels, shmems)))
+            },
+            Err(WinError::NoConnection) => Ok(OsIpcOneShotServerConnectionStatus::NotConnected(self)),
+            Err(e) => Err(e)
+        }
     }
 }
 
@@ -1792,6 +1857,7 @@ pub enum WinError {
     WindowsResult(u32),
     ChannelClosed,
     NoData,
+    NoConnection,
 }
 
 impl WinError {
@@ -1848,6 +1914,7 @@ impl fmt::Display for WinError {
             WinError::WindowsResult(errnum) => write!(fmt, "windows result: {}", WinError::error_string(errnum)),
             WinError::ChannelClosed => write!(fmt, "channel closed"),
             WinError::NoData => write!(fmt, "no data"),
+            WinError::NoConnection => write!(fmt, "no connection"),
         }
     }
 }
@@ -1891,6 +1958,9 @@ impl From<WinError> for io::Error {
             },
             WinError::NoData => {
                 io::Error::new(io::ErrorKind::WouldBlock, "Win channel has no data available")
+            },
+            WinError::NoConnection => {
+                io::Error::new(io::ErrorKind::WouldBlock, "Win channel has no connection") // TODO:
             },
             WinError::WindowsResult(err) => {
                 io::Error::from_raw_os_error(err as i32)
