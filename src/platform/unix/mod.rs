@@ -10,7 +10,7 @@
 use crate::ipc;
 use bincode;
 use fnv::FnvHasher;
-use libc::{EAGAIN, EWOULDBLOCK};
+use libc::{EAGAIN, EWOULDBLOCK, F_SETFL, O_NONBLOCK, F_GETFL};
 use libc::{self, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_SEQPACKET, SOL_SOCKET};
 use libc::{SO_LINGER, S_IFMT, S_IFSOCK, c_char, c_int, c_void, getsockopt};
 use libc::{iovec, mode_t, msghdr, off_t, recvmsg, sendmsg};
@@ -599,6 +599,11 @@ pub struct OsIpcOneShotServer {
     _temp_dir: TempDir,
 }
 
+pub enum OsIpcOneShotServerConnectionStatus {
+    Connected((OsIpcReceiver, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)),
+    NotConnected(OsIpcOneShotServer)
+}
+
 impl Drop for OsIpcOneShotServer {
     fn drop(&mut self) {
         unsafe {
@@ -626,6 +631,13 @@ impl OsIpcOneShotServer {
                 return Err(UnixError::last())
             }
 
+            // Because OsIpcOneShotServer::try_accept() needs to call multiple
+            // times, we set O_NONBLOCK and let OsIpcOneShotServer::accept() change
+            // it back to reduce call time of fcntl().
+            if libc::fcntl(fd, F_SETFL, libc::fcntl(fd, F_GETFL) | O_NONBLOCK) == -1 {
+                return Err(UnixError::last())
+            }
+
             Ok((OsIpcOneShotServer {
                 fd: fd,
                 _temp_dir: temp_dir,
@@ -638,6 +650,10 @@ impl OsIpcOneShotServer {
                                    Vec<OsOpaqueIpcChannel>,
                                    Vec<OsIpcSharedMemory>),UnixError> {
         unsafe {
+            if libc::fcntl(self.fd, F_SETFL, libc::fcntl(self.fd, F_GETFL) & (!O_NONBLOCK)) == -1 {
+                return Err(UnixError::last())
+            }
+
             let sockaddr: *mut sockaddr = ptr::null_mut();
             let sockaddr_len: *mut socklen_t = ptr::null_mut();
             let client_fd = libc::accept(self.fd, sockaddr, sockaddr_len);
@@ -649,6 +665,26 @@ impl OsIpcOneShotServer {
             let receiver = OsIpcReceiver::from_fd(client_fd);
             let (data, channels, shared_memory_regions) = receiver.recv()?;
             Ok((receiver, data, channels, shared_memory_regions))
+        }
+    }
+
+    pub fn try_accept(self) -> Result<OsIpcOneShotServerConnectionStatus, UnixError> {
+        unsafe {
+            let sockaddr: *mut sockaddr = ptr::null_mut();
+            let sockaddr_len: *mut socklen_t = ptr::null_mut();
+            let client_fd = libc::accept(self.fd, sockaddr, sockaddr_len);
+            if client_fd < 0 {
+                let errno = *libc::__errno_location();
+                return match errno {
+                    EWOULDBLOCK | EAGAIN => Ok(OsIpcOneShotServerConnectionStatus::NotConnected(self)),
+                    _ => Err(UnixError::last())
+                }
+            }
+            make_socket_lingering(client_fd)?;
+
+            let receiver = OsIpcReceiver::from_fd(client_fd);
+            let (data, channels, shared_memory_regions) = receiver.recv()?;
+            Ok(OsIpcOneShotServerConnectionStatus::Connected((receiver, data, channels, shared_memory_regions)))
         }
     }
 }
