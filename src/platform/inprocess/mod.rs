@@ -44,6 +44,14 @@ impl ServerRecord {
         self.conn_receiver.recv().unwrap();
     }
 
+    fn try_accept(&self) -> Result<bool, ChannelError> {
+        match self.conn_receiver.try_recv() {
+            Ok(_) => Ok(true),
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => Err(ChannelError::ChannelClosedError),
+        }
+    }
+
     fn connect(&self) {
         self.conn_sender.send(true).unwrap();
     }
@@ -254,6 +262,11 @@ pub struct OsIpcOneShotServer {
     name: String,
 }
 
+pub enum OsIpcOneShotServerConnectionStatus {
+    Connected((OsIpcReceiver, Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>)),
+    NotConnected(OsIpcOneShotServer)
+}
+
 impl OsIpcOneShotServer {
     pub fn new() -> Result<(OsIpcOneShotServer, String), ChannelError> {
         let (sender, receiver) = channel()?;
@@ -288,6 +301,25 @@ impl OsIpcOneShotServer {
         ONE_SHOT_SERVERS.lock().unwrap().remove(&self.name).unwrap();
         let (data, channels, shmems) = self.receiver.recv()?;
         Ok((self.receiver, data, channels, shmems))
+    }
+
+    pub fn try_accept(
+        self,
+    ) -> Result<OsIpcOneShotServerConnectionStatus, ChannelError> {
+        let record = ONE_SHOT_SERVERS
+            .lock()
+            .unwrap()
+            .get(&self.name)
+            .unwrap()
+            .clone();
+        
+        if !record.try_accept()? {
+            return Ok(OsIpcOneShotServerConnectionStatus::NotConnected(self))
+        }
+
+        ONE_SHOT_SERVERS.lock().unwrap().remove(&self.name).unwrap();
+        let (data, channels, shmems) = self.receiver.recv()?;
+        Ok(OsIpcOneShotServerConnectionStatus::Connected((self.receiver, data, channels, shmems)))
     }
 }
 
